@@ -18,7 +18,7 @@ Source organization: `fiducia-cloud`
 
 | Source | Commit | Branch observed |
 |---|---:|---|
-| `fiducia-cloud/fiducia-telemetry.rs` | `04a20decfbf22f1828c8b97efde3831476eb5214` | `main` |
+| `fiducia-cloud/fiducia-telemetry.rs` | `ba057021f16f8c70bf219259738e0504e573a026` | `main` |
 | `fiducia-cloud/fiducia-node.rs` | `b9177646f9c69c67b76b3fbee9fded9b585e9c0c` | `main` |
 
 ## Dependency lanes
