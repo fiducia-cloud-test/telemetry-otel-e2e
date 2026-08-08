@@ -20,7 +20,7 @@ concurrency:
 jobs:
   synthetic-location-matrix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out test-fleet harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,31 +36,49 @@ jobs:
         with:
           node-version: "22.22.1"
 
-      - name: Verify pinned source contracts and parse test code
+      - name: Verify exact vendored source contracts and parse test code
         shell: bash
         run: |
           set -euo pipefail
           test "$(git hash-object managed-beta/vendor/managed-beta-rules.yml)" = \
             "$(jq -r '.production_rules.blob' managed-beta/source-contract.json)"
+          test "$(git hash-object managed-beta/vendor/probe/scripts/managed-beta-sli-probe.mjs)" = \
+            "$(jq -r '.probe_source.script_blob' managed-beta/source-contract.json)"
+          test "$(git hash-object managed-beta/vendor/probe/docker/managed-beta-probe.Dockerfile)" = \
+            "$(jq -r '.probe_source.dockerfile_blob' managed-beta/source-contract.json)"
           test "$(jq -r '.production_rules.commit' managed-beta/source-contract.json)" = \
             'd22740b98a08dea6a30ca364c90ebd59c965b557'
           test "$(jq -r '.production_exporter.commit' managed-beta/source-contract.json)" = \
             'c9e8f32aa6b55d33116d867c952fad19fcafa741'
           test "$(jq -r '.production_exporter.blob' managed-beta/source-contract.json)" = \
             '5c17e3fe8817c9331e594c99300abee8c286fcfb'
-          test "$(jq -r '.production_exporter.loaded_by_test_fleet' managed-beta/source-contract.json)" = \
+          test "$(jq -r '.probe_source.commit' managed-beta/source-contract.json)" = \
+            '596449565cd2ec466ff72a533e8190ce389b4149'
+          test "$(jq -r '.probe_source.registry_access_from_test_org' managed-beta/source-contract.json)" = \
             'false'
           test "$(jq -r '.purpose' managed-beta/source-contract.json)" = \
             'Synthetic test-fleet validation only; never production evidence.'
+          node --check managed-beta/vendor/probe/scripts/managed-beta-sli-probe.mjs
           node --check scripts/assert-managed-beta-test-fleet.mjs
           python3 -m py_compile scripts/serve-prometheus-textfiles.py
 
-      - name: Pull the exact published images
+      - name: Pull the exact public Prometheus image
         shell: bash
         run: |
           set -euo pipefail
-          docker pull "$(jq -r '.probe_image' managed-beta/source-contract.json)"
           docker pull "$(jq -r '.prometheus_image' managed-beta/source-contract.json)"
+
+      - name: Build the exact reviewed probe source locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --pull \
+            --file managed-beta/vendor/probe/docker/managed-beta-probe.Dockerfile \
+            --tag fiducia-managed-beta-probe:test-fleet \
+            managed-beta/vendor/probe
+          test "$(docker image inspect --format '{{.Config.User}}' fiducia-managed-beta-probe:test-fleet)" = '1000:1000'
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' fiducia-managed-beta-probe:test-fleet)" = '["node","/opt/fiducia-probe/managed-beta-sli-probe.mjs"]'
 
       - name: Start bounded Fiducia response fixture
         shell: bash
@@ -84,7 +102,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="$(jq -r '.probe_image' managed-beta/source-contract.json)"
           root="$RUNNER_TEMP/probe-state"
           mkdir -p "$root/probe-a" "$root/probe-b"
           sudo chown -R 1000:1000 "$root"
@@ -103,7 +120,7 @@ jobs:
               --env FIDUCIA_PROBE_EXPECT_STATUS=200 \
               --env FIDUCIA_PROBE_STATE_FILE="/state/$operation.json" \
               --env FIDUCIA_PROBE_TEXTFILE="/state/$operation.prom" \
-              "$image"
+              fiducia-managed-beta-probe:test-fleet
           }
 
           for location in probe-a probe-b; do
