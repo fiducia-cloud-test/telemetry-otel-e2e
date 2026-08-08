@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "purpose": "Synthetic test-fleet validation only; never production evidence.",
   "production_exporter": {
     "repository": "fiducia-cloud/fiducia-e2e",
@@ -14,7 +14,16 @@
     "blob": "a6fc3318a441681fea94c04664b23b3042dbd7fe",
     "vendored_path": "managed-beta/vendor/managed-beta-rules.yml"
   },
-  "probe_image": "ghcr.io/fiducia-cloud/fiducia-managed-beta-probe@sha256:cc251cb82f131616e73c070929f4dd9066228d1a90e86c627933f787e63e0941",
+  "probe_source": {
+    "repository": "fiducia-cloud/fiducia-e2e",
+    "commit": "596449565cd2ec466ff72a533e8190ce389b4149",
+    "script_blob": "822be326969d7e32edbe05ebfaa03d8c945d39e2",
+    "dockerfile_blob": "dcbe5c69fe91076fd8f906cd04b285806abe17d0",
+    "vendored_root": "managed-beta/vendor/probe",
+    "published_image": "ghcr.io/fiducia-cloud/fiducia-managed-beta-probe@sha256:cc251cb82f131616e73c070929f4dd9066228d1a90e86c627933f787e63e0941",
+    "registry_access_from_test_org": false,
+    "test_execution": "Build the exact source and digest-pinned Dockerfile locally; do not weaken private package permissions or embed a cross-org credential."
+  },
   "prometheus_image": "prom/prometheus@sha256:b1935d181b6dd8e9c827705e89438815337e1b10ae35605126f05f44e5c6940f",
   "fixture_canary": "FIDUCIA_TEST_FLEET_CANARY_5d4f4a30"
 }
