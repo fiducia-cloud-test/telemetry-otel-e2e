@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/managed-beta-probe-location-e2e.yml"
       - "managed-beta/**"
+      - "scripts/assert-managed-beta-test-fleet.mjs"
       - "scripts/serve-prometheus-textfiles.py"
   workflow_dispatch:
 
@@ -31,36 +32,28 @@ jobs:
         with:
           args: .github/workflows/managed-beta-probe-location-e2e.yml
 
-      - name: Check out candidate exporter and probe source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-e2e
-          ref: agent/den-1404-evidence-window-coverage
-          path: source/fiducia-e2e
-
-      - name: Check out exact monitoring rules
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-infra
-          ref: d22740b98a08dea6a30ca364c90ebd59c965b557
-          path: source/fiducia-infra
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.22.1"
 
-      - name: Verify source contracts and parse test code
+      - name: Verify pinned source contracts and parse test code
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C source/fiducia-infra rev-parse HEAD)" = \
-            "$(jq -r '.fiducia_infra.expected_commit' managed-beta/source-contract.json)"
-          node --check source/fiducia-e2e/scripts/export-managed-beta-slo-evidence.mjs
-          python3 -m py_compile scripts/serve-prometheus-textfiles.py
+          test "$(git hash-object managed-beta/vendor/managed-beta-rules.yml)" = \
+            "$(jq -r '.production_rules.blob' managed-beta/source-contract.json)"
+          test "$(jq -r '.production_rules.commit' managed-beta/source-contract.json)" = \
+            'd22740b98a08dea6a30ca364c90ebd59c965b557'
+          test "$(jq -r '.production_exporter.commit' managed-beta/source-contract.json)" = \
+            'c9e8f32aa6b55d33116d867c952fad19fcafa741'
+          test "$(jq -r '.production_exporter.blob' managed-beta/source-contract.json)" = \
+            '5c17e3fe8817c9331e594c99300abee8c286fcfb'
+          test "$(jq -r '.production_exporter.loaded_by_test_fleet' managed-beta/source-contract.json)" = \
+            'false'
           test "$(jq -r '.purpose' managed-beta/source-contract.json)" = \
             'Synthetic test-fleet validation only; never production evidence.'
+          node --check scripts/assert-managed-beta-test-fleet.mjs
+          python3 -m py_compile scripts/serve-prometheus-textfiles.py
 
       - name: Pull the exact published images
         shell: bash
@@ -159,14 +152,13 @@ jobs:
             curl --fail --silent "http://127.0.0.1:$port/metrics" >/dev/null
           done
 
-      - name: Start pinned Prometheus with production rules
+      - name: Start pinned Prometheus with vendored production rules
         shell: bash
         run: |
           set -euo pipefail
           prom="$RUNNER_TEMP/prometheus"
-          mkdir -p "$prom/data"
-          cp source/fiducia-infra/observability/managed-beta-stack/managed-beta-rules.yml \
-            "$prom/managed-beta-rules.yml"
+          mkdir -p "$prom"
+          cp managed-beta/vendor/managed-beta-rules.yml "$prom/managed-beta-rules.yml"
           sed -i '0,/interval: 30s/s//interval: 1s/' "$prom/managed-beta-rules.yml"
           cat >"$prom/prometheus.yml" <<'YAML'
           global:
@@ -192,9 +184,9 @@ jobs:
           docker run --rm --detach \
             --name fiducia-test-prometheus \
             --network host \
+            --tmpfs /prometheus:rw,noexec,nosuid,nodev,mode=1777,size=64m \
             --volume "$prom/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
             --volume "$prom/managed-beta-rules.yml:/etc/prometheus/managed-beta-rules.yml:ro" \
-            --volume "$prom/data:/prometheus" \
             "$image" \
             --config.file=/etc/prometheus/prometheus.yml \
             --storage.tsdb.path=/prometheus \
@@ -206,7 +198,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:19090/-/ready >/dev/null
           sleep 4
 
-      - name: Prove location identity, operation isolation, and duplicate authority
+      - name: Prove trusted location identity and duplicate authority
         shell: bash
         run: |
           set -euo pipefail
@@ -222,9 +214,7 @@ jobs:
           test "$(scalar 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="health"}')" -eq 2
           test "$(scalar 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="secret_read"}')" -eq 2
           test "$(scalar 'fiducia:sli:external_probe_location_count{cell="cell-a",operation_class="health"}')" -eq 2
-
-          duplicate="$(scalar 'max(count by (probe_location,cell,operation_class,result) (fiducia_external_probe_total))')"
-          test "$duplicate" -ge 2
+          test "$(scalar 'max(count by (probe_location,cell,operation_class,result) (fiducia_external_probe_total))')" -ge 2
 
           raw="$(query 'fiducia_external_probe_total')"
           jq -e '[.data.result[].metric.probe_location] | sort | unique == ["probe-a","probe-b"]' <<<"$raw"
@@ -268,74 +258,42 @@ jobs:
           test "$health" -eq 2
           test "$secret" -eq 1
 
-      - name: Prove short-history evidence remains incomplete and bounded
+      - name: Produce bounded test-fleet evidence summary
         shell: bash
+        env:
+          FIDUCIA_TEST_PROMETHEUS_URL: http://127.0.0.1:19090
+          FIDUCIA_TEST_EVIDENCE_OUTPUT: managed-beta/test-fleet-evidence-summary.json
+          FIDUCIA_TEST_CELLS: cell-a
+          FIDUCIA_TEST_OPERATIONS: health,secret_read
+          FIDUCIA_TEST_LOCATIONS: probe-a,probe-b
+          FIDUCIA_TEST_EXPECTED_INTERVAL_SECONDS: "60"
+          FIDUCIA_TEST_WINDOW_DAYS: "28"
+          FIDUCIA_TEST_MINIMUM_COVERAGE_RATIO: "0.95"
+          FIDUCIA_TEST_MAX_FRESHNESS_SECONDS: "300"
+          FIDUCIA_TEST_MAX_LAST_SUCCESS_AGE_SECONDS: "900"
         run: |
           set -euo pipefail
-          source_commit="$(git -C source/fiducia-e2e rev-parse HEAD)"
-          infra_commit="$(git -C source/fiducia-infra rev-parse HEAD)"
-          image_digest="$(jq -r '.probe_image | split("@") | .[1]' managed-beta/source-contract.json)"
-          read -r window_start window_end < <(
-            python3 - <<'PY'
-          from datetime import datetime, timedelta, timezone
-          end = datetime.now(timezone.utc).replace(microsecond=0)
-          start = end - timedelta(days=28)
-          print(start.isoformat().replace('+00:00', 'Z'), end.isoformat().replace('+00:00', 'Z'))
-          PY
-          )
+          node scripts/assert-managed-beta-test-fleet.mjs
+          summary=managed-beta/test-fleet-evidence-summary.json
+          jq -e '.test_fleet_only == true' "$summary"
+          jq -e '.production_maturity_effect == "none"' "$summary"
+          jq -e '.synthetic_measurement_complete == false' "$summary"
+          jq -e '.observations.sample_coverage[0].complete == false' "$summary"
+          jq -e '.observations.freshness_violations | length >= 1' "$summary"
+          jq -e '.observations.last_success_violations | length >= 1' "$summary"
+          jq -e '.observations.duplicate_authorities | length >= 1' "$summary"
+          jq -e '.observations.counter_resets | length == 0' "$summary"
+          test "$(stat -c '%a' "$summary")" = '600'
 
-          set +e
-          FIDUCIA_PROMETHEUS_URL=http://127.0.0.1:19090 \
-          FIDUCIA_SLO_EXPORT_ALLOW_INSECURE_LOCALHOST=true \
-          FIDUCIA_SLO_EVIDENCE_OUTPUT="$RUNNER_TEMP/managed-beta-evidence.json" \
-          FIDUCIA_EVIDENCE_DECISION_ID=test-fleet-short-history \
-          FIDUCIA_PROMETHEUS_TARGET_ID=test-fleet-central \
-          FIDUCIA_RELEASE_SOURCE_COMMIT="$source_commit" \
-          FIDUCIA_RELEASE_CONFIG_COMMIT="$infra_commit" \
-          FIDUCIA_RULES_COMMIT="$infra_commit" \
-          FIDUCIA_RELEASE_IMAGE_DIGESTS="managed-beta-probe=$image_digest" \
-          FIDUCIA_RELEASE_CELLS=cell-a \
-          FIDUCIA_RELEASE_OPERATION_CLASSES=health,secret_read \
-          FIDUCIA_PROBE_LOCATIONS=probe-a,probe-b \
-          FIDUCIA_PROBE_INDEPENDENCE_ATTESTED=true \
-          FIDUCIA_PROBE_INDEPENDENCE_REVIEWER=test-fleet-synthetic \
-          FIDUCIA_PROBE_EXPECTED_INTERVAL_SECONDS=60 \
-          FIDUCIA_PROBE_MINIMUM_COVERAGE_RATIO=0.95 \
-          FIDUCIA_PROBE_MAX_FRESHNESS_SECONDS=300 \
-          FIDUCIA_PROBE_MAX_LAST_SUCCESS_AGE_SECONDS=900 \
-          FIDUCIA_DASHBOARD_UID=fiducia-managed-beta-slo \
-          FIDUCIA_DASHBOARD_VERSION=3 \
-          FIDUCIA_EVIDENCE_WINDOW_START="$window_start" \
-          FIDUCIA_EVIDENCE_WINDOW_END="$window_end" \
-          node source/fiducia-e2e/scripts/export-managed-beta-slo-evidence.mjs
-          status=$?
-          set -e
-          test "$status" -eq 1
-
-          evidence="$RUNNER_TEMP/managed-beta-evidence.json"
-          jq -e '.schema_version == 3' "$evidence"
-          jq -e '.candidate_measurement_complete == false' "$evidence"
-          jq -e '.measurement_policy.sample_coverage.complete == false' "$evidence"
-          jq -e '.measurement_policy.source_freshness.complete == false' "$evidence"
-          jq -e '.exact_queries[] | select(.id == "external_probe_authority_count") | .status == "prometheus_duplicate_probe_authority"' "$evidence"
           canary="$(jq -r '.fixture_canary' managed-beta/source-contract.json)"
-          if grep -F "$canary" "$evidence"; then
-            echo 'evidence leaked the fixture canary' >&2
+          if grep -F "$canary" "$summary"; then
+            echo 'test-fleet summary leaked the fixture canary' >&2
             exit 1
           fi
-          if grep -F '127.0.0.1:19200' "$evidence"; then
-            echo 'evidence leaked the probe endpoint' >&2
+          if grep -F '127.0.0.1:19200' "$summary"; then
+            echo 'test-fleet summary leaked the probe endpoint' >&2
             exit 1
           fi
-
-          jq '{
-            schema_version,
-            evidence_type,
-            candidate_measurement_complete,
-            measurement_policy,
-            query_statuses: [.exact_queries[] | {id, status, complete}],
-            limitations
-          }' "$evidence" > managed-beta/test-fleet-evidence-summary.json
 
       - name: Stop test processes
         if: always()
