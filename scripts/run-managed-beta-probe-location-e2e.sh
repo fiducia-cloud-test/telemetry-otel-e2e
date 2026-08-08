@@ -298,7 +298,7 @@ prove_initial_state() {
 
 make_secret_read_stale() {
   local path="$ROOT/probe-b/secret_read.prom"
-  local stale="$(( $(date +%s) - 1_000 ))"
+  local stale="$(( $(date +%s) - 1000 ))"
   sudo python3 - "$path" "$stale" <<'PY'
 import re
 import sys
