@@ -1,0 +1,348 @@
+name: Managed-beta probe location E2E
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/managed-beta-probe-location-e2e.yml"
+      - "managed-beta/**"
+      - "scripts/serve-prometheus-textfiles.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-location-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out test-fleet harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate this workflow
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: .github/workflows/managed-beta-probe-location-e2e.yml
+
+      - name: Check out candidate exporter and probe source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-e2e
+          ref: agent/den-1404-evidence-window-coverage
+          path: source/fiducia-e2e
+
+      - name: Check out exact monitoring rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-infra
+          ref: d22740b98a08dea6a30ca364c90ebd59c965b557
+          path: source/fiducia-infra
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.22.1"
+
+      - name: Verify source contracts and parse test code
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source/fiducia-infra rev-parse HEAD)" = \
+            "$(jq -r '.fiducia_infra.expected_commit' managed-beta/source-contract.json)"
+          node --check source/fiducia-e2e/scripts/export-managed-beta-slo-evidence.mjs
+          python3 -m py_compile scripts/serve-prometheus-textfiles.py
+          test "$(jq -r '.purpose' managed-beta/source-contract.json)" = \
+            'Synthetic test-fleet validation only; never production evidence.'
+
+      - name: Pull the exact published images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$(jq -r '.probe_image' managed-beta/source-contract.json)"
+          docker pull "$(jq -r '.prometheus_image' managed-beta/source-contract.json)"
+
+      - name: Start bounded Fiducia response fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/fiducia-fixture"
+          mkdir -p "$fixture"
+          jq -r '.fixture_canary' managed-beta/source-contract.json >"$fixture/index.html"
+          python3 -m http.server 19200 \
+            --bind 127.0.0.1 \
+            --directory "$fixture" \
+            >"$RUNNER_TEMP/fiducia-fixture.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/fiducia-fixture.pid"
+          for _ in $(seq 1 50); do
+            curl --fail --silent http://127.0.0.1:19200/ >/dev/null && break
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:19200/ >/dev/null
+
+      - name: Generate cumulative source state for two synthetic locations
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$(jq -r '.probe_image' managed-beta/source-contract.json)"
+          root="$RUNNER_TEMP/probe-state"
+          mkdir -p "$root/probe-a" "$root/probe-b"
+          sudo chown -R 1000:1000 "$root"
+
+          run_probe() {
+            local location="$1"
+            local operation="$2"
+            docker run --rm \
+              --read-only \
+              --network host \
+              --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+              --volume "$root/$location:/state" \
+              --env FIDUCIA_PROBE_ENDPOINT=http://127.0.0.1:19200/ \
+              --env FIDUCIA_PROBE_CELL=cell-a \
+              --env FIDUCIA_PROBE_OPERATION_CLASS="$operation" \
+              --env FIDUCIA_PROBE_EXPECT_STATUS=200 \
+              --env FIDUCIA_PROBE_STATE_FILE="/state/$operation.json" \
+              --env FIDUCIA_PROBE_TEXTFILE="/state/$operation.prom" \
+              "$image"
+          }
+
+          for location in probe-a probe-b; do
+            for operation in health secret_read; do
+              run_probe "$location" "$operation"
+              run_probe "$location" "$operation"
+            done
+          done
+
+          canary="$(jq -r '.fixture_canary' managed-beta/source-contract.json)"
+          if sudo grep -R -F "$canary" "$root"; then
+            echo 'probe state or metrics leaked the response canary' >&2
+            exit 1
+          fi
+          if sudo grep -R -F '127.0.0.1:19200' "$root"; then
+            echo 'probe state or metrics leaked the endpoint' >&2
+            exit 1
+          fi
+          if sudo grep -R -F 'probe_location' "$root"; then
+            echo 'probe runtime self-asserted monitoring topology identity' >&2
+            exit 1
+          fi
+
+      - name: Start two locations plus one deliberate duplicate authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/probe-state"
+          python3 scripts/serve-prometheus-textfiles.py \
+            --directory "$root/probe-a" --port 19201 \
+            >"$RUNNER_TEMP/probe-a-metrics.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/probe-a-metrics.pid"
+          python3 scripts/serve-prometheus-textfiles.py \
+            --directory "$root/probe-b" --port 19202 \
+            >"$RUNNER_TEMP/probe-b-metrics.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/probe-b-metrics.pid"
+          python3 scripts/serve-prometheus-textfiles.py \
+            --directory "$root/probe-a" --port 19203 \
+            >"$RUNNER_TEMP/probe-a-duplicate.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/probe-a-duplicate.pid"
+          for port in 19201 19202 19203; do
+            for _ in $(seq 1 50); do
+              curl --fail --silent "http://127.0.0.1:$port/metrics" >/dev/null && break
+              sleep 0.1
+            done
+            curl --fail --silent "http://127.0.0.1:$port/metrics" >/dev/null
+          done
+
+      - name: Start pinned Prometheus with production rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          prom="$RUNNER_TEMP/prometheus"
+          mkdir -p "$prom/data"
+          cp source/fiducia-infra/observability/managed-beta-stack/managed-beta-rules.yml \
+            "$prom/managed-beta-rules.yml"
+          sed -i '0,/interval: 30s/s//interval: 1s/' "$prom/managed-beta-rules.yml"
+          cat >"$prom/prometheus.yml" <<'YAML'
+          global:
+            scrape_interval: 1s
+            evaluation_interval: 1s
+          rule_files:
+            - /etc/prometheus/managed-beta-rules.yml
+          scrape_configs:
+            - job_name: managed-beta-external-probes
+              honor_labels: false
+              static_configs:
+                - targets: ["127.0.0.1:19201"]
+                  labels:
+                    probe_location: probe-a
+                - targets: ["127.0.0.1:19202"]
+                  labels:
+                    probe_location: probe-b
+                - targets: ["127.0.0.1:19203"]
+                  labels:
+                    probe_location: probe-a
+          YAML
+          image="$(jq -r '.prometheus_image' managed-beta/source-contract.json)"
+          docker run --rm --detach \
+            --name fiducia-test-prometheus \
+            --network host \
+            --volume "$prom/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+            --volume "$prom/managed-beta-rules.yml:/etc/prometheus/managed-beta-rules.yml:ro" \
+            --volume "$prom/data:/prometheus" \
+            "$image" \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/prometheus \
+            --web.listen-address=127.0.0.1:19090
+          for _ in $(seq 1 100); do
+            curl --fail --silent http://127.0.0.1:19090/-/ready >/dev/null && break
+            sleep 0.2
+          done
+          curl --fail --silent http://127.0.0.1:19090/-/ready >/dev/null
+          sleep 4
+
+      - name: Prove location identity, operation isolation, and duplicate authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          query() {
+            curl --fail --silent --get \
+              --data-urlencode "query=$1" \
+              http://127.0.0.1:19090/api/v1/query
+          }
+          scalar() {
+            query "$1" | jq -er '.data.result[0].value[1] | tonumber'
+          }
+
+          test "$(scalar 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="health"}')" -eq 2
+          test "$(scalar 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="secret_read"}')" -eq 2
+          test "$(scalar 'fiducia:sli:external_probe_location_count{cell="cell-a",operation_class="health"}')" -eq 2
+
+          duplicate="$(scalar 'max(count by (probe_location,cell,operation_class,result) (fiducia_external_probe_total))')"
+          test "$duplicate" -ge 2
+
+          raw="$(query 'fiducia_external_probe_total')"
+          jq -e '[.data.result[].metric.probe_location] | sort | unique == ["probe-a","probe-b"]' <<<"$raw"
+          jq -e 'all(.data.result[]; (.metric.tenant_id // "") == "" and (.metric.project_id // "") == "")' <<<"$raw"
+
+      - name: Make one secret-read location stale without masking health
+        shell: bash
+        run: |
+          set -euo pipefail
+          path="$RUNNER_TEMP/probe-state/probe-b/secret_read.prom"
+          stale="$(( $(date +%s) - 1_000 ))"
+          sudo python3 - "$path" "$stale" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          stale = sys.argv[2]
+          text = path.read_text()
+          text = re.sub(
+              r'(fiducia_external_probe_last_run_unixtime\{[^}]+\})\s+\d+',
+              rf'\g<1> {stale}',
+              text,
+          )
+          text = re.sub(
+              r'(fiducia_external_probe_last_success_unixtime\{[^}]+\})\s+\d+',
+              rf'\g<1> {stale}',
+              text,
+          )
+          path.write_text(text)
+          PY
+          sleep 4
+
+          query() {
+            curl --fail --silent --get \
+              --data-urlencode "query=$1" \
+              http://127.0.0.1:19090/api/v1/query
+          }
+          health="$(query 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="health"}' | jq -er '.data.result[0].value[1] | tonumber')"
+          secret="$(query 'fiducia:sli:external_probe_fresh_location_count{cell="cell-a",operation_class="secret_read"}' | jq -er '.data.result[0].value[1] | tonumber')"
+          test "$health" -eq 2
+          test "$secret" -eq 1
+
+      - name: Prove short-history evidence remains incomplete and bounded
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git -C source/fiducia-e2e rev-parse HEAD)"
+          infra_commit="$(git -C source/fiducia-infra rev-parse HEAD)"
+          image_digest="$(jq -r '.probe_image | split("@") | .[1]' managed-beta/source-contract.json)"
+          read -r window_start window_end < <(
+            python3 - <<'PY'
+          from datetime import datetime, timedelta, timezone
+          end = datetime.now(timezone.utc).replace(microsecond=0)
+          start = end - timedelta(days=28)
+          print(start.isoformat().replace('+00:00', 'Z'), end.isoformat().replace('+00:00', 'Z'))
+          PY
+          )
+
+          set +e
+          FIDUCIA_PROMETHEUS_URL=http://127.0.0.1:19090 \
+          FIDUCIA_SLO_EXPORT_ALLOW_INSECURE_LOCALHOST=true \
+          FIDUCIA_SLO_EVIDENCE_OUTPUT="$RUNNER_TEMP/managed-beta-evidence.json" \
+          FIDUCIA_EVIDENCE_DECISION_ID=test-fleet-short-history \
+          FIDUCIA_PROMETHEUS_TARGET_ID=test-fleet-central \
+          FIDUCIA_RELEASE_SOURCE_COMMIT="$source_commit" \
+          FIDUCIA_RELEASE_CONFIG_COMMIT="$infra_commit" \
+          FIDUCIA_RULES_COMMIT="$infra_commit" \
+          FIDUCIA_RELEASE_IMAGE_DIGESTS="managed-beta-probe=$image_digest" \
+          FIDUCIA_RELEASE_CELLS=cell-a \
+          FIDUCIA_RELEASE_OPERATION_CLASSES=health,secret_read \
+          FIDUCIA_PROBE_LOCATIONS=probe-a,probe-b \
+          FIDUCIA_PROBE_INDEPENDENCE_ATTESTED=true \
+          FIDUCIA_PROBE_INDEPENDENCE_REVIEWER=test-fleet-synthetic \
+          FIDUCIA_PROBE_EXPECTED_INTERVAL_SECONDS=60 \
+          FIDUCIA_PROBE_MINIMUM_COVERAGE_RATIO=0.95 \
+          FIDUCIA_PROBE_MAX_FRESHNESS_SECONDS=300 \
+          FIDUCIA_PROBE_MAX_LAST_SUCCESS_AGE_SECONDS=900 \
+          FIDUCIA_DASHBOARD_UID=fiducia-managed-beta-slo \
+          FIDUCIA_DASHBOARD_VERSION=3 \
+          FIDUCIA_EVIDENCE_WINDOW_START="$window_start" \
+          FIDUCIA_EVIDENCE_WINDOW_END="$window_end" \
+          node source/fiducia-e2e/scripts/export-managed-beta-slo-evidence.mjs
+          status=$?
+          set -e
+          test "$status" -eq 1
+
+          evidence="$RUNNER_TEMP/managed-beta-evidence.json"
+          jq -e '.schema_version == 3' "$evidence"
+          jq -e '.candidate_measurement_complete == false' "$evidence"
+          jq -e '.measurement_policy.sample_coverage.complete == false' "$evidence"
+          jq -e '.measurement_policy.source_freshness.complete == false' "$evidence"
+          jq -e '.exact_queries[] | select(.id == "external_probe_authority_count") | .status == "prometheus_duplicate_probe_authority"' "$evidence"
+          canary="$(jq -r '.fixture_canary' managed-beta/source-contract.json)"
+          if grep -F "$canary" "$evidence"; then
+            echo 'evidence leaked the fixture canary' >&2
+            exit 1
+          fi
+          if grep -F '127.0.0.1:19200' "$evidence"; then
+            echo 'evidence leaked the probe endpoint' >&2
+            exit 1
+          fi
+
+          jq '{
+            schema_version,
+            evidence_type,
+            candidate_measurement_complete,
+            measurement_policy,
+            query_statuses: [.exact_queries[] | {id, status, complete}],
+            limitations
+          }' "$evidence" > managed-beta/test-fleet-evidence-summary.json
+
+      - name: Stop test processes
+        if: always()
+        shell: bash
+        run: |
+          docker rm --force fiducia-test-prometheus >/dev/null 2>&1 || true
+          for pidfile in "$RUNNER_TEMP"/*.pid; do
+            test -e "$pidfile" || continue
+            kill "$(cat "$pidfile")" 2>/dev/null || true
+          done
