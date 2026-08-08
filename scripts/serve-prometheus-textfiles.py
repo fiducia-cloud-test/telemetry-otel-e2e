@@ -6,6 +6,11 @@ runners use a different UID, so this test-only collector preserves those
 permissions and falls back to the runner's passwordless, non-interactive
 ``sudo cat`` for files it cannot read directly. Paths are selected only by a
 bounded glob beneath the resolved directory.
+
+Multiple probe textfiles repeat Prometheus HELP/TYPE metadata for the same metric
+families. A single HTTP exposition may contain each metadata directive only once,
+so the collector deduplicates identical directives while preserving every labeled
+sample. Conflicting metadata fails closed.
 """
 
 from __future__ import annotations
@@ -38,6 +43,42 @@ def read_prom_file(directory: Path, path: Path) -> str:
         return completed.stdout
 
 
+def metadata_key(line: str) -> tuple[str, str] | None:
+    if line.startswith("# HELP ") or line.startswith("# TYPE "):
+        parts = line.split(maxsplit=3)
+        if len(parts) < 3:
+            raise RuntimeError("Malformed Prometheus metadata directive")
+        return parts[1], parts[2]
+    return None
+
+
+def merge_prom_files(directory: Path) -> bytes:
+    metadata: dict[tuple[str, str], str] = {}
+    output: list[str] = []
+    total = 0
+    for path in sorted(directory.glob("*.prom")):
+        for raw_line in read_prom_file(directory, path).splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            key = metadata_key(line)
+            if key is not None:
+                existing = metadata.get(key)
+                if existing is not None:
+                    if existing != line:
+                        raise RuntimeError(
+                            f"Conflicting Prometheus metadata for {key[1]}"
+                        )
+                    continue
+                metadata[key] = line
+            encoded_length = len(line.encode("utf-8")) + 1
+            total += encoded_length
+            if total > MAX_RESPONSE_BYTES:
+                raise RuntimeError("Prometheus fixture response exceeds its bound")
+            output.append(line)
+    return ("\n".join(output) + "\n").encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     directory: Path
 
@@ -45,15 +86,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in {"/", "/metrics"}:
             self.send_error(404)
             return
-        chunks: list[str] = []
-        total = 0
-        for path in sorted(self.directory.glob("*.prom")):
-            chunk = read_prom_file(self.directory, path).rstrip() + "\n"
-            total += len(chunk.encode("utf-8"))
-            if total > MAX_RESPONSE_BYTES:
-                raise RuntimeError("Prometheus fixture response exceeds its bound")
-            chunks.append(chunk)
-        body = "".join(chunks).encode("utf-8")
+        body = merge_prom_files(self.directory)
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.send_header("Content-Length", str(len(body)))
