@@ -1,0 +1,29 @@
+{
+  "schema_version": 3,
+  "purpose": "Synthetic test-fleet validation only; never production evidence.",
+  "production_exporter": {
+    "repository": "fiducia-cloud/fiducia-e2e",
+    "commit": "c9e8f32aa6b55d33116d867c952fad19fcafa741",
+    "blob": "5c17e3fe8817c9331e594c99300abee8c286fcfb",
+    "loaded_by_test_fleet": false,
+    "reason": "The test-org Actions token intentionally cannot read the private production repository; production exporter behavior is covered by its own green CI and this harness asserts the integrated policy independently."
+  },
+  "production_rules": {
+    "repository": "fiducia-cloud/fiducia-infra",
+    "commit": "d22740b98a08dea6a30ca364c90ebd59c965b557",
+    "blob": "a6fc3318a441681fea94c04664b23b3042dbd7fe",
+    "vendored_path": "managed-beta/vendor/managed-beta-rules.yml"
+  },
+  "probe_source": {
+    "repository": "fiducia-cloud/fiducia-e2e",
+    "commit": "596449565cd2ec466ff72a533e8190ce389b4149",
+    "script_blob": "822be326969d7e32edbe05ebfaa03d8c945d39e2",
+    "dockerfile_blob": "dcbe5c69fe91076fd8f906cd04b285806abe17d0",
+    "vendored_root": "managed-beta/vendor/probe",
+    "published_image": "ghcr.io/fiducia-cloud/fiducia-managed-beta-probe@sha256:cc251cb82f131616e73c070929f4dd9066228d1a90e86c627933f787e63e0941",
+    "registry_access_from_test_org": false,
+    "test_execution": "Build the exact source and digest-pinned Dockerfile locally; do not weaken private package permissions or embed a cross-org credential."
+  },
+  "prometheus_image": "prom/prometheus@sha256:b1935d181b6dd8e9c827705e89438815337e1b10ae35605126f05f44e5c6940f",
+  "fixture_canary": "FIDUCIA_TEST_FLEET_CANARY_5d4f4a30"
+}
